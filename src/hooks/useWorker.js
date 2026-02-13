@@ -61,6 +61,10 @@ export default function useWorker() {
                     setDashboardData(msg.data);
                     break;
 
+                case 'extended_dashboard_data':
+                    setDashboardData(prev => prev ? ({ ...prev, extended: msg.data }) : { extended: msg.data });
+                    break;
+
                 case 'custom_cards_data':
                     setCustomCardsData(msg.cardsData);
                     break;

@@ -7,7 +7,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'https://itcatalystindia.com/Development/CustomerPortal_API',
+        target: 'https://www.itcatalystindia.com/Development/CustomerPortal_API',
         changeOrigin: true,
         secure: false,
       },
