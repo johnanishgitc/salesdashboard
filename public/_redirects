@@ -1,2 +1,2 @@
-/api/*  /.netlify/functions/api-proxy/:splat  200!
+/api/*  https://www.itcatalystindia.com/Development/CustomerPortal_API/api/:splat  200!
 /*      /index.html  200

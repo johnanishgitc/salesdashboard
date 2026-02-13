@@ -1,4 +1,4 @@
-const BACKEND_BASE = 'https://www.itcatalystindia.com/Development/CustomerPortal_API';
+const BACKEND_BASE = 'https://www.itcatalystindia.com/Development/CustomerPortal_API/api';
 
 function corsHeaders(origin) {
   return {

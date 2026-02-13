@@ -10,7 +10,7 @@
 # API must be first so it matches before the SPA catch-all
 [[redirects]]
   from = "/api/*"
-  to = "/.netlify/functions/api-proxy/:splat"
+  to = "https://www.itcatalystindia.com/Development/CustomerPortal_API/api/:splat"
   status = 200
   force = true
 
