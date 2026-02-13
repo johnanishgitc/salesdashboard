@@ -56,6 +56,7 @@ const Login = () => {
                         </label>
                         <input
                             type="email"
+                            autoComplete="email"
                             required
                             className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
                             placeholder="you@example.com"
@@ -70,6 +71,7 @@ const Login = () => {
                         </label>
                         <input
                             type="password"
+                            autoComplete="current-password"
                             required
                             className="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors"
                             placeholder="••••••••"
