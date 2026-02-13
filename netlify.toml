@@ -3,6 +3,11 @@
   publish = "dist"
   functions = "netlify/functions"
 
+[functions]
+  node_bundler = "esbuild"
+  directory = "netlify/functions"
+
+# API must be first so it matches before the SPA catch-all
 [[redirects]]
   from = "/api/*"
   to = "/.netlify/functions/api-proxy/:splat"
