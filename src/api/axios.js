@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 // In dev: always use relative path so Vite proxy forwards /api to backend (avoids CORS).
-// In production: use VITE_API_BASE if set (e.g. Netlify), else same-origin /api.
+// In production: use '/' so Netlify proxies /api/* to backend (no CORS). Set VITE_API_BASE only if backend allows CORS.
 const baseURL = import.meta.env.DEV
     ? '/'
     : (import.meta.env.VITE_API_BASE ?? '/');
