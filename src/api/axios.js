@@ -1,8 +1,25 @@
 import axios from 'axios';
 
+// In dev: always use relative path so Vite proxy forwards /api to backend (avoids CORS).
+// In production: use VITE_API_BASE if set (e.g. Netlify), else same-origin /api.
+const baseURL = import.meta.env.DEV
+    ? '/'
+    : (import.meta.env.VITE_API_BASE ?? '/');
+
 const api = axios.create({
-    baseURL: '/', // Use relative path to trigger Vite proxy
+    baseURL,
 });
+
+// When using direct backend URL, paths are "login" not "api/login"
+const isDirectBackend = baseURL !== '/' && !baseURL.startsWith('/');
+if (isDirectBackend) {
+    api.interceptors.request.use((config) => {
+        if (typeof config.url === 'string' && config.url.startsWith('api/')) {
+            config.url = config.url.slice(4);
+        }
+        return config;
+    });
+}
 
 // Add a request interceptor to include the auth token
 api.interceptors.request.use(
