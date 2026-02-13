@@ -1,0 +1,3 @@
+
+/api/*  https://www.itcatalystindia.com/Development/CustomerPortal_API/:splat  200!
+/*  /index.html  200
