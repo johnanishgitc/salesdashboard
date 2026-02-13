@@ -2,7 +2,10 @@ const BACKEND_BASE = 'https://www.itcatalystindia.com/Development/CustomerPortal
 
 export default async (request) => {
   const pathname = new URL(request.url).pathname;
-  const path = pathname.replace(/^.*\/api-proxy\/?/, '') || '';
+  // Rewrite: /.netlify/functions/api-proxy/login  OR  original /api/login
+  const path = pathname.includes('/api-proxy/')
+    ? pathname.replace(/^.*\/api-proxy\/?/, '')
+    : pathname.replace(/^\/api\/?/, '');
   const backendUrl = `${BACKEND_BASE}/${path}`;
   const method = request.method;
   const headers = new Headers(request.headers);
