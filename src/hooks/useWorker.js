@@ -57,16 +57,10 @@ export default function useWorker() {
                     setStats(msg.stats);
                     break;
 
-                case 'dashboard_data':
+                case 'all_dashboard_data':
+                    // Combined response: set dashboard + extended + custom cards in one update
                     setDashboardData(msg.data);
-                    break;
-
-                case 'extended_dashboard_data':
-                    setDashboardData(prev => prev ? ({ ...prev, extended: msg.data }) : { extended: msg.data });
-                    break;
-
-                case 'custom_cards_data':
-                    setCustomCardsData(msg.cardsData);
+                    if (msg.cardsData) setCustomCardsData(msg.cardsData);
                     break;
 
                 case 'raw_data':

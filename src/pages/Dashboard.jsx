@@ -51,7 +51,7 @@ const Dashboard = () => {
     const [company, setCompany] = useState({});
     const [fromDate, setFromDate] = useState('2025-04-01');
     const [toDate, setToDate] = useState(new Date().toISOString().split('T')[0]);
-    
+
     // Debounced date state for fetching data (primitives to avoid object ref issues)
     const [appliedFromDate, setAppliedFromDate] = useState('2025-04-01');
     const [appliedToDate, setAppliedToDate] = useState(new Date().toISOString().split('T')[0]);
@@ -85,7 +85,7 @@ const Dashboard = () => {
         const yyyy = now.getFullYear();
         const mm = now.getMonth(); // 0-11
         const dd = String(now.getDate()).padStart(2, '0');
-        
+
         let startStr = '';
         const endStr = now.toISOString().split('T')[0];
 
@@ -149,33 +149,15 @@ const Dashboard = () => {
         fetchCards();
     }, [company.guid]);
 
-    // Request KPI + core + extended dashboard data
+    // Request ALL dashboard data in a single combined worker message
     useEffect(() => {
         if (isReady && company.guid) {
             const filters = {};
             Object.values(activeFilters).forEach(f => {
                 filters[f.dimension] = f.value;
             });
-            sendMessage('get_dashboard_data', {
-                guid: company.guid,
-                fromDate: appliedFromDate.replace(/-/g, ''),
-                toDate: appliedToDate.replace(/-/g, ''),
-                filters
-            });
-            // Fetch extended data separately (async) to unblock UI
-            sendMessage('get_extended_dashboard_data', {
-                guid: company.guid,
-                fromDate: appliedFromDate.replace(/-/g, ''),
-                toDate: appliedToDate.replace(/-/g, ''),
-                filters
-            });
-        }
-    }, [isReady, company.guid, sendMessage, appliedFromDate, appliedToDate, activeFilters]);
 
-    // Request custom card data from worker once API cards are loaded
-    useEffect(() => {
-        if (isReady && company.guid && apiCards.length > 0) {
-            const cardsWithDates = apiCards.map(card => {
+            const cards = apiCards.map(card => {
                 const periodSettings = cardSettings.cardPeriodSettings?.[card.title];
                 let cardFrom = appliedFromDate.replace(/-/g, '');
                 let cardTo = appliedToDate.replace(/-/g, '');
@@ -186,17 +168,12 @@ const Dashboard = () => {
                 return { ...card, _fromDate: cardFrom, _toDate: cardTo };
             });
 
-            const filters = {};
-            Object.values(activeFilters).forEach(f => {
-                filters[f.dimension] = f.value;
-            });
-
-            sendMessage('get_custom_cards_data', {
+            sendMessage('get_all_dashboard_data', {
                 guid: company.guid,
                 fromDate: appliedFromDate.replace(/-/g, ''),
                 toDate: appliedToDate.replace(/-/g, ''),
-                cards: cardsWithDates,
-                filters
+                filters,
+                cards
             });
         }
     }, [isReady, company.guid, apiCards, sendMessage, appliedFromDate, appliedToDate, cardSettings, activeFilters]);
@@ -207,28 +184,13 @@ const Dashboard = () => {
             Object.values(activeFilters).forEach(f => {
                 filters[f.dimension] = f.value;
             });
-            sendMessage('get_dashboard_data', {
+            sendMessage('get_all_dashboard_data', {
                 guid: company.guid,
                 fromDate: fromDate.replace(/-/g, ''),
                 toDate: toDate.replace(/-/g, ''),
-                filters
+                filters,
+                cards: apiCards
             });
-            sendMessage('get_extended_dashboard_data', {
-                guid: company.guid,
-                fromDate: fromDate.replace(/-/g, ''),
-                toDate: toDate.replace(/-/g, ''),
-                filters
-            });
-
-            if (apiCards.length > 0) {
-                sendMessage('get_custom_cards_data', {
-                    guid: company.guid,
-                    fromDate: fromDate.replace(/-/g, ''),
-                    toDate: toDate.replace(/-/g, ''),
-                    cards: apiCards,
-                    filters
-                });
-            }
         }
     }, [isReady, company.guid, sendMessage, fromDate, toDate, apiCards, activeFilters]);
 

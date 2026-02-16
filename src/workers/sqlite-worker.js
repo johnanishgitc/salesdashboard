@@ -7,6 +7,39 @@ let db = null;
 const post = (type, data = {}) => self.postMessage({ type, ...data });
 const progress = (current, total, message) => post('progress', { current, total, message });
 
+// ─── LRU Result Cache ───────────────────────────────────────────────
+const MAX_CACHE_SIZE = 20;
+const queryCache = new Map();
+
+const cacheKey = (guid, fromDate, toDate, filters) => {
+    const fStr = filters ? JSON.stringify(filters, Object.keys(filters).sort()) : '';
+    return `${guid}:${fromDate}:${toDate}:${fStr}`;
+};
+
+const cacheGet = (key) => {
+    if (!queryCache.has(key)) return null;
+    const val = queryCache.get(key);
+    // Move to end (most recently used)
+    queryCache.delete(key);
+    queryCache.set(key, val);
+    return val;
+};
+
+const cacheSet = (key, val) => {
+    if (queryCache.has(key)) queryCache.delete(key);
+    queryCache.set(key, val);
+    // Evict oldest if over limit
+    if (queryCache.size > MAX_CACHE_SIZE) {
+        const oldest = queryCache.keys().next().value;
+        queryCache.delete(oldest);
+    }
+};
+
+const cacheClear = () => queryCache.clear();
+
+// Strip commas from Tally's Indian number formatting (e.g., "10,00,000.00" → "10000000.00")
+const stripCommas = (val) => val ? String(val).replace(/,/g, '') : val;
+
 const fmtDate = (d) => {
     const yyyy = d.getFullYear();
     const mm = String(d.getMonth() + 1).padStart(2, '0');
@@ -136,20 +169,25 @@ const initDb = async () => {
         // Ignore "duplicate column name" error
     }
 
-    // Migration: Populate agg_daily_stats if empty but vouchers exist
+    // Migration: Force rebuild aggregates when code changes (version bump)
+    const AGG_VERSION = 2; // Bump this to force rebuild (v2 = comma-stripping fix)
     try {
         const hasVouchers = db.selectValue("SELECT 1 FROM vouchers LIMIT 1");
-        const hasStats = db.selectValue("SELECT 1 FROM agg_daily_stats LIMIT 1");
-        if (hasVouchers && !hasStats) {
-             console.log('[Worker] Migrating: Populating aggregates...');
-             // We need a GUID to rebuild. Just rebuild for all distinct GUIDs found.
-             const guids = db.selectValues("SELECT DISTINCT guid FROM vouchers");
-             for(const g of guids) {
-                 rebuildAggregates(g);
-             }
-             console.log('[Worker] Migration complete: Aggregates populated');
+        if (hasVouchers) {
+            const currentVersion = db.selectValue("SELECT value FROM sync_meta WHERE key='agg_version'");
+            if (!currentVersion || Number(currentVersion) < AGG_VERSION) {
+                console.log(`[Worker] Aggregate version mismatch (have: ${currentVersion}, need: ${AGG_VERSION}). Rebuilding...`);
+                const guids = db.selectValues("SELECT DISTINCT guid FROM vouchers");
+                for (const g of guids) {
+                    rebuildAggregates(g);
+                }
+                // Store the new version
+                db.exec(`DELETE FROM sync_meta WHERE key='agg_version'`);
+                db.exec(`INSERT INTO sync_meta (key, value) VALUES ('agg_version', '${AGG_VERSION}')`);
+                console.log('[Worker] Aggregates rebuilt with comma fix (v' + AGG_VERSION + ')');
+            }
         }
-    } catch(e) {
+    } catch (e) {
         console.warn('[Worker] Aggregate migration failed', e);
     }
 
@@ -202,7 +240,7 @@ const insertVouchers = (vouchers, guid) => {
                 s(v.masterid), n(v.alterid), s(v.vouchertypename), s(v.vouchertypereservedname),
                 s(v.vouchernumber), s(nd), s(v.partyledgername), s(v.partyledgernameid),
                 s(v.state), s(v.country), s(v.partygstin), s(v.pincode), s(v.address),
-                s(v.amount), s(v.iscancelled || 'No'), s(v.isoptional || 'No'), s(guid), s(sp)
+                s(stripCommas(v.amount)), s(v.iscancelled || 'No'), s(v.isoptional || 'No'), s(guid), s(sp)
             ]);
             stmtV.step(); stmtV.reset();
 
@@ -211,7 +249,7 @@ const insertVouchers = (vouchers, guid) => {
                 for (const le of v.ledgerentries) {
                     stmtL.bind([
                         s(v.masterid), s(guid), s(le.ledgername), s(le.ledgernameid),
-                        s(le.amount), s(le.isdeemedpositive), s(le.ispartyledger),
+                        s(stripCommas(le.amount)), s(le.isdeemedpositive), s(le.ispartyledger),
                         s(le.group), s(le.groupofgroup), s(le.grouplist), s(le.ledgergroupidentify)
                     ]);
                     stmtL.step(); stmtL.reset();
@@ -224,7 +262,7 @@ const insertVouchers = (vouchers, guid) => {
                     stmtI.bind([
                         s(v.masterid), s(guid), s(ie.stockitemname), s(ie.stockitemnameid),
                         s(ie.uom), s(ie.actualqty), s(ie.billedqty), s(ie.rate), s(ie.discount),
-                        s(ie.amount), s(ie.stockitemgroup), s(ie.stockitemgroupofgroup),
+                        s(stripCommas(ie.amount)), s(ie.stockitemgroup), s(ie.stockitemgroupofgroup),
                         s(ie.stockitemgrouplist), s(ie.grosscost), s(ie.grossexpense), s(ie.profit)
                     ]);
                     stmtI.step(); stmtI.reset();
@@ -241,16 +279,16 @@ const insertVouchers = (vouchers, guid) => {
 const rebuildAggregates = (guid) => {
     try {
         db.exec('BEGIN TRANSACTION');
-        
+
         // 1. Core Daily Stats
         db.exec(`DELETE FROM agg_daily_stats WHERE guid='${guid}'`);
         db.exec(`
             INSERT INTO agg_daily_stats (date, guid, total_sales, total_txns, max_sale)
             SELECT 
               date, '${guid}', 
-              SUM(CASE WHEN vouchertypereservedname LIKE '%Credit Note%' THEN -CAST(amount AS REAL) ELSE CAST(amount AS REAL) END),
+              SUM(CASE WHEN vouchertypereservedname LIKE '%Credit Note%' THEN -CAST(REPLACE(amount, ',', '') AS REAL) ELSE CAST(REPLACE(amount, ',', '') AS REAL) END),
               COUNT(*),
-              MAX(CASE WHEN vouchertypereservedname NOT LIKE '%Credit Note%' THEN CAST(amount AS REAL) ELSE 0 END)
+              MAX(CASE WHEN vouchertypereservedname NOT LIKE '%Credit Note%' THEN CAST(REPLACE(amount, ',', '') AS REAL) ELSE 0 END)
             FROM vouchers 
             WHERE guid='${guid}' AND iscancelled='No'
             GROUP BY date
@@ -263,7 +301,7 @@ const rebuildAggregates = (guid) => {
 
         // 2. Extended Charts Aggregation (Pre-calculate all chart data)
         db.exec(`DELETE FROM agg_charts WHERE guid='${guid}'`);
-        
+
         db.exec(`DROP TABLE IF EXISTS _v_agg`);
         db.exec(`
             CREATE TEMP TABLE _v_agg AS 
@@ -282,7 +320,7 @@ const rebuildAggregates = (guid) => {
         // Stock Groups
         db.exec(`
             INSERT INTO agg_charts (guid, date, dim_type, dim_name, amount)
-            SELECT '${guid}', v.date, 'stock_group', i.stockitemgroup, SUM(v.sign * CAST(i.amount AS REAL))
+            SELECT '${guid}', v.date, 'stock_group', i.stockitemgroup, SUM(v.sign * CAST(REPLACE(i.amount, ',', '') AS REAL))
             FROM inventory_entries i JOIN _v_agg v ON i.voucher_masterid=v.masterid 
             GROUP BY v.date, i.stockitemgroup
         `);
@@ -290,7 +328,7 @@ const rebuildAggregates = (guid) => {
         // Ledger Groups
         db.exec(`
             INSERT INTO agg_charts (guid, date, dim_type, dim_name, amount)
-            SELECT '${guid}', v.date, 'ledger_group', l.groupname, SUM(v.sign * CAST(l.amount AS REAL))
+            SELECT '${guid}', v.date, 'ledger_group', l.groupname, SUM(v.sign * CAST(REPLACE(l.amount, ',', '') AS REAL))
             FROM ledger_entries l JOIN _v_agg v ON l.voucher_masterid=v.masterid 
             GROUP BY v.date, l.groupname
         `);
@@ -298,14 +336,14 @@ const rebuildAggregates = (guid) => {
         // Country
         db.exec(`
             INSERT INTO agg_charts (guid, date, dim_type, dim_name, amount)
-            SELECT '${guid}', date, 'country', COALESCE(NULLIF(country,''),'Unknown'), SUM(sign * CAST(amount AS REAL))
+            SELECT '${guid}', date, 'country', COALESCE(NULLIF(country,''),'Unknown'), SUM(sign * CAST(REPLACE(amount, ',', '') AS REAL))
             FROM _v_agg GROUP BY date, country
         `);
 
         // Salesperson
         db.exec(`
             INSERT INTO agg_charts (guid, date, dim_type, dim_name, amount)
-            SELECT '${guid}', date, 'salesperson', COALESCE(NULLIF(salesperson,''),'Unknown'), SUM(sign * CAST(amount AS REAL))
+            SELECT '${guid}', date, 'salesperson', COALESCE(NULLIF(salesperson,''),'Unknown'), SUM(sign * CAST(REPLACE(amount, ',', '') AS REAL))
             FROM _v_agg GROUP BY date, salesperson
         `);
 
@@ -313,7 +351,7 @@ const rebuildAggregates = (guid) => {
         db.exec(`
             INSERT INTO agg_charts (guid, date, dim_type, dim_name, amount, qty, profit)
             SELECT '${guid}', v.date, 'item', i.stockitemname, 
-                   SUM(v.sign * CAST(i.amount AS REAL)),
+                   SUM(v.sign * CAST(REPLACE(i.amount, ',', '') AS REAL)),
                    SUM(CAST(i.billedqty AS REAL)),
                    SUM(CAST(i.profit AS REAL))
             FROM inventory_entries i JOIN _v_agg v ON i.voucher_masterid=v.masterid 
@@ -323,7 +361,7 @@ const rebuildAggregates = (guid) => {
         db.exec(`DROP TABLE IF EXISTS _v_agg`);
         db.exec('COMMIT');
         console.log('[Worker] Aggregates rebuilt successfully');
-    } catch(e) {
+    } catch (e) {
         console.error('[Worker] rebuildAggregates failed', e);
         db.exec('ROLLBACK');
         post('error', { message: `Aggregate Build Failed: ${e.message}` });
@@ -342,6 +380,24 @@ const fetchChunk = async (payload, token) => {
     return response.json();
 };
 
+const fetchChunkWithRetry = async (payload, token, maxRetries = 3) => {
+    let attempt = 0;
+    while (attempt <= maxRetries) {
+        try {
+            return await fetchChunk(payload, token);
+        } catch (err) {
+            attempt++;
+            if (attempt > maxRetries) {
+                throw new Error(`Failed after ${maxRetries} retries: ${err.message}`);
+            }
+            console.warn(`[Worker] Chunk failed, retrying (${attempt}/${maxRetries})...`, err);
+            // Wait for 1 second * attempt number before retrying (exponential backoff)
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+            post('status', { status: 'retry', message: `Retrying chunk... (${attempt}/${maxRetries})` });
+        }
+    }
+};
+
 // ─── Download ───────────────────────────────────────────────────────
 
 const handleDownload = async (payload) => {
@@ -353,11 +409,12 @@ const handleDownload = async (payload) => {
         const chunk = chunks[i];
         progress(i + 1, chunks.length, `Fetching ${chunk.from} → ${chunk.to}`);
         try {
-            const data = await fetchChunk({ tallyloc_id, company, guid, fromdate: chunk.from, todate: chunk.to, lastaltid: 0, serverslice: 'No', vouchertype: '$$isSales, $$IsCreditNote' }, token);
+            const data = await fetchChunkWithRetry({ tallyloc_id, company, guid, fromdate: chunk.from, todate: chunk.to, lastaltid: 0, serverslice: 'No', vouchertype: '$$isSales, $$IsCreditNote' }, token);
             if (data.vouchers && data.vouchers.length > 0) totalRecords += insertVouchers(data.vouchers, guid);
         } catch (err) {
-            console.error(`[Worker] Chunk failed:`, err);
-            post('error', { message: `Failed on chunk ${chunk.from}: ${err.message}` });
+            console.error(`[Worker] Chunk failed after retries:`, err);
+            post('error', { message: `Download stopped. Failed on chunk ${chunk.from}: ${err.message}` });
+            return; // Stop the download process
         }
     }
     const now = new Date().toISOString();
@@ -365,9 +422,10 @@ const handleDownload = async (payload) => {
     db.exec(`INSERT OR REPLACE INTO sync_meta (key,value) VALUES ('last_sync_guid','${guid}')`);
     db.exec(`INSERT OR REPLACE INTO sync_meta (key,value) VALUES ('last_sync_from','${fromdate}')`);
     db.exec(`INSERT OR REPLACE INTO sync_meta (key,value) VALUES ('last_sync_to','${todate}')`);
-    
+
     post('status', { status: 'downloading', message: 'Finalizing: Building aggregates...' });
     rebuildAggregates(guid);
+    cacheClear();
 
     post('download_complete', { totalRecords, message: `Download complete: ${totalRecords} vouchers synced` });
 };
@@ -386,16 +444,21 @@ const handleUpdate = async (payload) => {
         const chunk = chunks[i];
         progress(i + 1, chunks.length, `Updating ${chunk.from} → ${chunk.to}`);
         try {
-            const data = await fetchChunk({ tallyloc_id, company, guid, fromdate: chunk.from, todate: chunk.to, lastaltid: maxAlterId, serverslice: 'No', vouchertype: '$$isSales, $$IsCreditNote' }, token);
+            const data = await fetchChunkWithRetry({ tallyloc_id, company, guid, fromdate: chunk.from, todate: chunk.to, lastaltid: maxAlterId, serverslice: 'No', vouchertype: '$$isSales, $$IsCreditNote' }, token);
             if (data.vouchers && data.vouchers.length > 0) totalRecords += insertVouchers(data.vouchers, guid);
-        } catch (err) { console.error(`[Worker] Update chunk failed:`, err); }
+        } catch (err) {
+            console.error(`[Worker] Update chunk failed after retries:`, err);
+            post('error', { message: `Update stopped. Failed on chunk ${chunk.from}: ${err.message}` });
+            return; // Stop the update process
+        }
     }
     const now = new Date().toISOString();
     db.exec(`INSERT OR REPLACE INTO sync_meta (key,value) VALUES ('last_sync_time','${now}')`);
     db.exec(`INSERT OR REPLACE INTO sync_meta (key,value) VALUES ('last_sync_to','${todate}')`);
-    
+
     post('status', { status: 'updating', message: 'Finalizing: Updating aggregates...' });
     rebuildAggregates(guid);
+    cacheClear();
 
     post('update_complete', { totalRecords, message: `Update complete: ${totalRecords} vouchers` });
 };
@@ -421,6 +484,7 @@ const handleClear = (guid) => {
     db.exec(`DELETE FROM inventory_entries WHERE guid='${guid}'`);
     db.exec(`DELETE FROM vouchers WHERE guid='${guid}'`);
     db.exec(`DELETE FROM sync_meta`);
+    cacheClear();
     post('clear_complete', { message: 'Cache cleared' });
 };
 
@@ -428,10 +492,10 @@ const handleClear = (guid) => {
 
 const getDashboardData = (guid, fromDate, toDate, filters = {}) => {
     const safe = (val) => val ? String(val).replace(/'/g, "''") : '';
-    
+
     // Check if we have item-level filters that require complex joining/filtering
     const hasItemFilter = !!(filters.stockGroup || filters.stockItem || filters.ledgerGroup);
-    
+
     // FAST PATH: If no complex item filters, use agg_daily_stats and direct index scans
     if (!hasItemFilter) {
         // 1. KPIs & Trend from agg_daily_stats (Instant)
@@ -439,24 +503,25 @@ const getDashboardData = (guid, fromDate, toDate, filters = {}) => {
         // agg_daily_stats is only (guid, date). 
         // If we have state/customer filters, we cannot use agg_daily_stats for KPIs.
         const hasDimensionFilter = !!(filters.state || filters.country || filters.customer || filters.salesperson || filters.period);
-        
+
         // If query is PURE (only Date Range), use Aggregates
         if (!hasDimensionFilter) {
+            // KPIs: Use pre-aggregated agg_daily_stats (~365 rows/year vs 100K+ raw vouchers)
             const rawKpi = db.selectObject(`
                 SELECT 
-                    SUM(total_sales) as totalSales, 
-                    SUM(total_txns) as totalTxns, 
-                    MAX(max_sale) as maxSale 
+                    SUM(total_sales) as totalSales,
+                    SUM(total_txns) as totalTxns,
+                    MAX(max_sale) as maxSale
                 FROM agg_daily_stats 
                 WHERE guid='${guid}' AND date>='${fromDate}' AND date<='${toDate}'
             `);
-            
+
             const kpi = {
                 totalSales: rawKpi?.totalSales || 0,
                 totalTxns: rawKpi?.totalTxns || 0,
                 maxSale: rawKpi?.maxSale || 0
             };
-            
+
             kpi.avgOrderValue = kpi.totalTxns > 0 ? kpi.totalSales / kpi.totalTxns : 0;
 
             const salesTrend = db.selectObjects(`
@@ -467,12 +532,11 @@ const getDashboardData = (guid, fromDate, toDate, filters = {}) => {
             `) || [];
 
             // 2. Dimensional Charts (Direct Index Scan on Vouchers)
-            // Using idx_vouchers_analytics: (guid, iscancelled, date, state, partyledgername, amount)
             const baseWhere = `guid='${guid}' AND iscancelled='No' AND date>='${fromDate}' AND date<='${toDate}'`;
-            
+
             const salesByState = db.selectObjects(`
                 SELECT COALESCE(NULLIF(state,''),'Unknown') as name, 
-                       SUM(CASE WHEN vouchertypereservedname LIKE '%Credit Note%' THEN -CAST(amount AS REAL) ELSE CAST(amount AS REAL) END) as value 
+                       SUM(CASE WHEN vouchertypereservedname LIKE '%Credit Note%' THEN -CAST(REPLACE(amount, ',', '') AS REAL) ELSE CAST(REPLACE(amount, ',', '') AS REAL) END) as value 
                 FROM vouchers 
                 WHERE ${baseWhere} 
                 GROUP BY name ORDER BY value DESC
@@ -480,20 +544,18 @@ const getDashboardData = (guid, fromDate, toDate, filters = {}) => {
 
             const topCustomers = db.selectObjects(`
                 SELECT partyledgername as name, 
-                       SUM(CASE WHEN vouchertypereservedname LIKE '%Credit Note%' THEN -CAST(amount AS REAL) ELSE CAST(amount AS REAL) END) as value 
+                       SUM(CASE WHEN vouchertypereservedname LIKE '%Credit Note%' THEN -CAST(REPLACE(amount, ',', '') AS REAL) ELSE CAST(REPLACE(amount, ',', '') AS REAL) END) as value 
                 FROM vouchers 
                 WHERE ${baseWhere} 
                 GROUP BY partyledgername ORDER BY value DESC LIMIT 10
             `) || [];
 
-            // 3. Top Items (Join Inventory) - Still need join, but avoid _fv creation
+            // 3. Top Items from pre-aggregated agg_charts (avoids expensive JOIN)
             const topItems = db.selectObjects(`
-                SELECT i.stockitemname as name, 
-                       SUM(CASE WHEN v.vouchertypereservedname LIKE '%Credit Note%' THEN -CAST(i.amount AS REAL) ELSE CAST(i.amount AS REAL) END) as value 
-                FROM inventory_entries i 
-                JOIN vouchers v ON i.voucher_masterid = v.masterid 
-                WHERE v.guid='${guid}' AND v.iscancelled='No' AND v.date>='${fromDate}' AND v.date<='${toDate}'
-                GROUP BY i.stockitemname ORDER BY value DESC LIMIT 10
+                SELECT dim_name as name, SUM(amount) as value 
+                FROM agg_charts 
+                WHERE guid='${guid}' AND dim_type='item' AND date>='${fromDate}' AND date<='${toDate}' 
+                GROUP BY dim_name ORDER BY value DESC LIMIT 10
             `) || [];
 
             // 4. Extended Data (Direct)
@@ -518,7 +580,7 @@ const getDashboardData = (guid, fromDate, toDate, filters = {}) => {
         SELECT masterid, date, partyledgername, state, country, amount,
                vouchertypereservedname, salesperson,
                CASE WHEN vouchertypereservedname LIKE '%Credit Note%' THEN 1 ELSE 0 END AS is_cn,
-               CAST(amount AS REAL) AS amt
+               CAST(REPLACE(amount, ',', '') AS REAL) AS amt
         FROM vouchers
         WHERE guid='${guid}' AND iscancelled='No' AND date>='${fromDate}' AND date<='${toDate}' ${filterClauses}`);
 
@@ -535,7 +597,7 @@ const getDashboardData = (guid, fromDate, toDate, filters = {}) => {
 
         const qry = `
             SELECT SUM(
-                CASE WHEN f.is_cn THEN -CAST(i.amount AS REAL) ELSE CAST(i.amount AS REAL) END
+                CASE WHEN f.is_cn THEN -CAST(REPLACE(i.amount, ',', '') AS REAL) ELSE CAST(REPLACE(i.amount, ',', '') AS REAL) END
             ) 
             FROM inventory_entries i 
             JOIN _fv f ON i.voucher_masterid = f.masterid 
@@ -555,7 +617,7 @@ const getDashboardData = (guid, fromDate, toDate, filters = {}) => {
     const salesTrend = db.selectObjects(`SELECT date, SUM(CASE WHEN is_cn THEN -amt ELSE amt END) as total FROM _fv GROUP BY date ORDER BY date ASC`) || [];
     const salesByState = db.selectObjects(`SELECT COALESCE(NULLIF(state,''),'Unknown') as name, SUM(CASE WHEN is_cn THEN -amt ELSE amt END) as value FROM _fv GROUP BY name ORDER BY value DESC`) || [];
     const topCustomers = db.selectObjects(`SELECT partyledgername as name, SUM(CASE WHEN is_cn THEN -amt ELSE amt END) as value FROM _fv GROUP BY partyledgername ORDER BY value DESC LIMIT 10`) || [];
-    const topItems = db.selectObjects(`SELECT i.stockitemname as name, SUM(CASE WHEN f.is_cn THEN -CAST(i.amount AS REAL) ELSE CAST(i.amount AS REAL) END) as value FROM inventory_entries i JOIN _fv f ON i.voucher_masterid=f.masterid WHERE i.guid=? GROUP BY i.stockitemname ORDER BY value DESC LIMIT 10`, [guid]) || [];
+    const topItems = db.selectObjects(`SELECT i.stockitemname as name, SUM(CASE WHEN f.is_cn THEN -CAST(REPLACE(i.amount, ',', '') AS REAL) ELSE CAST(REPLACE(i.amount, ',', '') AS REAL) END) as value FROM inventory_entries i JOIN _fv f ON i.voucher_masterid=f.masterid WHERE i.guid=? GROUP BY i.stockitemname ORDER BY value DESC LIMIT 10`, [guid]) || [];
 
     // ── Extended data ──
     db.exec(`DROP TABLE IF EXISTS _fv`);
@@ -576,8 +638,8 @@ const getExtendedDashboardData = (guid) => {
     // Since we lazy load this inside getDashboardData "Slow Path", _fv exists there.
     // For Fast Path, we need a new function.
     return {
-        salesByStockGroup: db.selectObjects(`SELECT i.stockitemgroup as name, SUM(CASE WHEN f.is_cn THEN -CAST(i.amount AS REAL) ELSE CAST(i.amount AS REAL) END) as value FROM inventory_entries i JOIN _fv f ON i.voucher_masterid=f.masterid WHERE i.guid='${guid}' GROUP BY name ORDER BY value DESC LIMIT 10`),
-        salesByLedgerGroup: db.selectObjects(`SELECT l.groupname as name, SUM(CASE WHEN f.is_cn THEN -CAST(l.amount AS REAL) ELSE CAST(l.amount AS REAL) END) as value FROM ledger_entries l JOIN _fv f ON l.voucher_masterid=f.masterid WHERE l.guid='${guid}' GROUP BY name ORDER BY value DESC LIMIT 10`),
+        salesByStockGroup: db.selectObjects(`SELECT i.stockitemgroup as name, SUM(CASE WHEN f.is_cn THEN -CAST(REPLACE(i.amount, ',', '') AS REAL) ELSE CAST(REPLACE(i.amount, ',', '') AS REAL) END) as value FROM inventory_entries i JOIN _fv f ON i.voucher_masterid=f.masterid WHERE i.guid='${guid}' GROUP BY name ORDER BY value DESC LIMIT 10`),
+        salesByLedgerGroup: db.selectObjects(`SELECT l.groupname as name, SUM(CASE WHEN f.is_cn THEN -CAST(REPLACE(l.amount, ',', '') AS REAL) ELSE CAST(REPLACE(l.amount, ',', '') AS REAL) END) as value FROM ledger_entries l JOIN _fv f ON l.voucher_masterid=f.masterid WHERE l.guid='${guid}' GROUP BY name ORDER BY value DESC LIMIT 10`),
         salesByCountry: db.selectObjects(`SELECT COALESCE(NULLIF(country,''),'Unknown') as name, SUM(CASE WHEN is_cn THEN -amt ELSE amt END) as value FROM _fv GROUP BY name ORDER BY value DESC`),
         salesByPeriod: db.selectObjects(`SELECT SUBSTR(date,1,6) as period, SUM(CASE WHEN is_cn THEN -amt ELSE amt END) as value FROM _fv GROUP BY period ORDER BY period ASC`),
         monthWiseProfit: db.selectObjects(`SELECT SUBSTR(f.date,1,6) as period, SUM(CAST(i.profit AS REAL)) as value FROM inventory_entries i JOIN _fv f ON i.voucher_masterid=f.masterid WHERE i.guid='${guid}' GROUP BY period ORDER BY period ASC`),
@@ -593,15 +655,15 @@ const getExtendedDashboardData = (guid) => {
 const getExtendedDashboardData_Direct = (guid, fromDate, toDate) => {
     // Optimization: Check if aggregates exist. If not, rebuild them (Self-Healing).
     const hasData = db.selectValue(`SELECT 1 FROM agg_charts WHERE guid='${guid}' LIMIT 1`);
-    
+
     if (!hasData) {
         console.warn('[Worker] Aggregates missing in getExtendedDashboardData, rebuilding...');
         // We need to check if we have data to rebuild from!
         const hasVouchers = db.selectValue(`SELECT 1 FROM vouchers WHERE guid='${guid}' LIMIT 1`);
         if (hasVouchers) {
-             rebuildAggregates(guid);
+            rebuildAggregates(guid);
         } else {
-             return {}; // No data at all
+            return {}; // No data at all
         }
     }
 
@@ -619,7 +681,7 @@ const getExtendedDashboardData_Direct = (guid, fromDate, toDate) => {
         salesByLedgerGroup: db.selectObjects(aggQuery('ledger_group')),
         salesByCountry: db.selectObjects(aggQuery('country')),
         salesBySalesperson: db.selectObjects(aggQuery('salesperson')),
-        
+
         // Items
         // We stored items as 'item' dim_type with amount, qty, profit columns
         topItemsByQty: db.selectObjects(`
@@ -654,7 +716,7 @@ const getExtendedDashboardData_Direct = (guid, fromDate, toDate) => {
             WHERE guid='${guid}' AND date>='${fromDate}' AND date<='${toDate}' 
             GROUP BY period ORDER BY period ASC
         `),
-        
+
         monthWiseProfit: db.selectObjects(`
             SELECT SUBSTR(date,1,6) as period, SUM(profit) as value 
             FROM agg_charts 
@@ -698,9 +760,9 @@ const resolveValue = (valueField, aggregation) => {
     }
     // sum aggregation
     const fieldMap = {
-        'amount': "SUM(CASE WHEN v.vouchertypereservedname LIKE '%Credit Note%' THEN -CAST(v.amount AS REAL) ELSE CAST(v.amount AS REAL) END)",
+        'amount': "SUM(CASE WHEN v.vouchertypereservedname LIKE '%Credit Note%' THEN -CAST(REPLACE(v.amount, ',', '') AS REAL) ELSE CAST(REPLACE(v.amount, ',', '') AS REAL) END)",
         'profit': "SUM(CASE WHEN v.vouchertypereservedname LIKE '%Credit Note%' THEN -CAST(i.profit AS REAL) ELSE CAST(i.profit AS REAL) END)",
-        'allinventoryentries.accountingallocation.amount': "SUM(CASE WHEN v.vouchertypereservedname LIKE '%Credit Note%' THEN -CAST(i.amount AS REAL) ELSE CAST(i.amount AS REAL) END)",
+        'allinventoryentries.accountingallocation.amount': "SUM(CASE WHEN v.vouchertypereservedname LIKE '%Credit Note%' THEN -CAST(REPLACE(i.amount, ',', '') AS REAL) ELSE CAST(REPLACE(i.amount, ',', '') AS REAL) END)",
         'transactions': 'COUNT(DISTINCT v.masterid)',
         'unique_customers': 'COUNT(DISTINCT v.partyledgername)',
         'unique_orders': 'COUNT(DISTINCT v.masterid)',
@@ -965,41 +1027,30 @@ self.onmessage = async (e) => {
                 handleClear(payload.guid);
                 break;
 
-            case 'get_dashboard_data': {
+            case 'get_all_dashboard_data': {
                 const fromDate = payload.fromDate || '00000000';
                 const toDate = payload.toDate || '99999999';
                 const filters = payload.filters || {};
-                const data = getDashboardData(payload.guid, fromDate, toDate, filters);
-                post('dashboard_data', { data });
-                break;
-            }
+                const cards = payload.cards || [];
 
-            case 'get_extended_dashboard_data': {
-                const fromDate = payload.fromDate || '00000000';
-                const toDate = payload.toDate || '99999999';
-                const filters = payload.filters || {};
-                // Determine which method to use based on filters (Fast vs Slow Path logic duplicated? Or just use Direct for now?)
-                // The worker's getDashboardData has complex logic for Fast/Slow.
-                // We should probably expose a "getExtended" function that handles both?
-                // For now, let's assume if it came here, it's either. 
-                // Let's use getExtendedDashboardData_Direct if no complex filters, else Slow Path?
-                // Actually, getExtendedDashboardData (Slow) relies on _fv existing, which is DROPPED at end of getDashboardData.
-                // So we MUST use Direct or rebuild _fv.
-                // Rebuilding _fv is slow. Direct is slow for FYTD.
-                // Let's use Direct for now as it's the structure we have.
-                // Optimally for FYTD we should use _fv.
-                // FIX: Let's use Direct for "Extended" always for now, as it's cleaner.
-                const data = getExtendedDashboardData_Direct(payload.guid, fromDate, toDate);
-                post('extended_dashboard_data', { data });
-                break;
-            }
+                // Check LRU cache first
+                const key = cacheKey(payload.guid, fromDate, toDate, filters);
+                const cached = cacheGet(key);
+                if (cached) {
+                    console.log('[Worker] Cache HIT for', key.substring(0, 40));
+                    post('all_dashboard_data', cached);
+                    break;
+                }
 
-            case 'get_custom_cards_data': {
-                const fromDate = payload.fromDate || '00000000';
-                const toDate = payload.toDate || '99999999';
-                const filters = payload.filters || {};
-                const cardsData = computeAllCards(payload.cards, payload.guid, fromDate, toDate, filters);
-                post('custom_cards_data', { cardsData });
+                console.time('[Worker] get_all_dashboard_data');
+                const dashboard = getDashboardData(payload.guid, fromDate, toDate, filters);
+                const extended = getExtendedDashboardData_Direct(payload.guid, fromDate, toDate);
+                const cardsData = cards.length > 0 ? computeAllCards(cards, payload.guid, fromDate, toDate, filters) : {};
+                const result = { data: { ...dashboard, extended }, cardsData };
+                console.timeEnd('[Worker] get_all_dashboard_data');
+
+                cacheSet(key, result);
+                post('all_dashboard_data', result);
                 break;
             }
 
