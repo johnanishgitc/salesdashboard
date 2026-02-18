@@ -7,6 +7,13 @@
   node_bundler = "esbuild"
   directory = "netlify/functions"
 
+# Required for SharedArrayBuffer / OPFS (SQLite persistent storage)
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Embedder-Policy = "require-corp"
+
 # API must be first so it matches before the SPA catch-all
 [[redirects]]
   from = "/api/*"
